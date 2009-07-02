@@ -2,6 +2,7 @@
   (:import (java.net URL Authenticator PasswordAuthentication))
   (:use [clojure.xml :as xml :only []]
         [clojure.contrib.repl-ln :only [repl]]
+        [clojure.contrib.prxml :only [prxml]]
         [net.cgrand.enlive-html :as enlive :only []]))
 
 (def *auth*)
@@ -9,6 +10,7 @@
 (def *ticket-id*)
 (def *ticket*)
 (def *dup-to*)
+(def *error-response*)
 
 (def milestones
   #{{:id :bugs    :milestone "95732", :branch "1.0",    :dup-to :backlog}
@@ -27,33 +29,75 @@
 (Authenticator/setDefault
   (proxy [Authenticator] []
     (getPasswordAuthentication []
-      (prn :auth-site (.getRequestingSite this))
-      (when-let [[user pw] (*auth* (.getRequestingSite this))]
-        (PasswordAuthentication. user pw)))))
+      (when-let [[user pw] *auth*]
+        (PasswordAuthentication. user (.toCharArray pw))))))
 
-(defn parse-assembla [& parts]
+(defn get-assembla [& parts]
   (let [url-str (apply str "http://www.assembla.com/" parts)
         conn (.openConnection (URL. url-str))]
     (.setRequestMethod conn "GET")
     (.setRequestProperty conn "Accept" "application/xml")
     ;(println "connecting...")
-    (.connect conn)
-    (when (>= (.getResponseCode conn) 400)
-      (throw (Exception. (str "HTTP error " (.getResponseCode conn)
-                              ": " url-str))))
-    ;(println "reading...")
     (with-open [input (.getInputStream conn)]
       (xml/parse input))))
+
+(defn post-assembla! [url-path vxml]
+  (set! *error-response* nil)
+  ;(let [url-str (str "http://localhost:8888/" url-path)
+  (let [url-str (str "http://www.assembla.com/" url-path)
+        conn (.openConnection (URL. url-str))]
+    (doto conn
+      (.setRequestMethod "POST")
+      (.setRequestProperty "Content-type" "application/xml")
+      (.setRequestProperty "Accept" "application/xml")
+      (.setDoOutput true))
+    (.connect conn)
+    (with-open [output (java.io.OutputStreamWriter.
+                         (.getOutputStream conn) "UTF-8")]
+      (binding [*out* output]
+        (prxml vxml)))
+    (try
+      (with-open [input (.getInputStream conn)]
+        (xml/parse input))
+      (catch java.io.IOException e
+        (with-open [err (.getErrorStream conn)]
+                   (println
+                     (apply str
+                            (map char (take-while pos?
+                                                  (repeatedly #(.read err)))))))
+          ;(set! *error-response* (xml/parse err)))
+        (throw e)))))
 
 (let [users (atom {})]
   (defn get-user [id]
     (or (@users id)
-      (let [user (parse-assembla "user/best_profile/" id)]
+      (let [user (get-assembla "user/best_profile/" id)]
         (swap! users assoc id user)
         user))))
 
-(defn parse-ticket [project id]
-  (parse-assembla "spaces/" project "/tickets/" id))
+(defn get-ticket [project id]
+  (get-assembla "spaces/" project "/tickets/" id))
+
+(defn create-ticket [attrmap]
+  [:ticket
+    (when-let [t (:title attrmap)]
+      [:summary t])
+    (when-let [username (:assigned-to attrmap)]
+      [:assigned-to-id
+        (throw (Exception. ":assigned-to not working yet"))])
+    (when-let [m (:milestone attrmap)]
+      [:milestone-id
+        (((uindex milestones [:id]) [m]) :milestone)])
+    (when-let [p (:priority attrmap)] ; 1 (highest) - 5 (lowest)
+      [:priority p])
+    (when-let [c (:component attrmap)]
+      [:component-id
+        (throw (Exception. ":component not working yet"))])
+    (when-let [s (:status attrmap)]
+      [:status
+        (throw (Exception. ":status not working yet"))])
+    (when-let [d (:text attrmap)]
+      [:description d])])
 
 (defmacro select-content [elem & query]
   `(apply str (mapcat :content (enlive/select [~elem] [~@query]))))
@@ -83,20 +127,38 @@
 (defn ticket
   ([id] (ticket *project* id))
   ([project id]
-   (set! *ticket* (parse-ticket project id))
+   (set! *ticket* (get-ticket project id))
    (set! *ticket-id* id)
    (println (str "\n=== #" id ": " (select-title *ticket*) " ==="))
    (set! *dup-to* (:dup-to (select-milestone *ticket*)))
    (println "Milestone" (:id (select-milestone *ticket*))
-            "-- Dup-to" *dup-to*)
+            "   Dup-to" *dup-to*)
    (doseq [{:keys [user link-line]} (linked-tickets *ticket*)]
      (let [comment-len (min (- 76 (count user)) (count link-line))]
        (println (str "<" user "> " (subs link-line 0 comment-len)))))))
 
+(defn dup-ticket []
+  {:title (select-title *ticket*)
+   :milestone *dup-to*
+   :priority (select-content *ticket* :ticket :> :priority)
+   :text (str "This ticket is for tracking #" *ticket-id*
+              " against branch "
+              (((uindex milestones [:id]) [*dup-to*]) :branch))})
+
+(defn dup-ticket! []
+  ; (let [new-num (select-ticket-number
+  (post-assembla!
+    (str "spaces/" *project* "/tickets/")
+    (create-ticket (dup-ticket)))
+  ;(update-ticket! ...)
+  ;(str "Created ticket #" new-num "to track this issue against branch 1.0."
+  )
+
 (defn go []
-  (binding [*auth* {}
+  (binding [*auth* nil
             *project* "clojure"
             *ticket-id* nil
             *ticket* nil
-            *dup-to* nil]
+            *dup-to* nil
+            *error-response* nil]
     (repl)))
