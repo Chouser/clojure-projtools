@@ -3,13 +3,17 @@
   (:use [clojure.xml :as xml :only []]
         [clojure.contrib.repl-ln :only [repl]]
         [clojure.contrib.prxml :only [prxml]]
+        [clojure.contrib.shell-out :only [sh with-sh-dir]]
+        [clojure.contrib.seq-utils :only [indexed]]
         [net.cgrand.enlive-html :as enlive :only []]))
 
 (def *auth*)
 (def *project*)
+(def *project-dir*)
 (def *ticket-id*)
 (def *ticket*)
 (def *dup-to*)
+(def *patches*)
 (def *error-response*)
 
 (def milestones
@@ -117,12 +121,31 @@
     {:user (select-login (get-user (select-content tcmt :user-id)))
      :comment (select-content tcmt :comment)}))
 
+(defmacro git [& args]
+  `(with-sh-dir *project-dir*
+     (sh "git"
+       ~@(mapcat
+           #(cond
+              (string? %) [%]
+              (and (seq? %) (= (first %) `unquote)) [`(str ~(second %))]
+              (and (seq? %) (= (first %) `unquote-splicing))
+                    `(map str ~(second %))
+              :else [(str %)])
+           args))))
+
 (defn linked-tickets [ticket]
   (for [{:keys [comment] :as tcmt} (select-comments ticket)
         :let [match (re-find #"^(?!Updating tickets \(.*\)).*#\d+.*(?:\n|$)"
                              comment)]
         :when match]
     (assoc tcmt :link-line match)))
+
+(defn linked-commits [ticket]
+  (for [{:keys [comment] :as tcmt} (select-comments ticket)
+        [_ sha1] (re-seq #"\[\[(?:r:|[^|]*\|)([0-9a-f]{6,})\]\]" comment)]
+    (assoc tcmt
+           :sha1 sha1
+           :title (git log "--pretty=format:%s" ~sha1 -1))))
 
 (defn ticket
   ([id] (ticket *project* id))
@@ -133,12 +156,15 @@
    (set! *dup-to* (:dup-to (select-milestone *ticket*)))
    (println "Milestone" (:id (select-milestone *ticket*))
             "   Dup-to" *dup-to*)
+   (set! *patches* (linked-commits *ticket*))
+   (doseq [[patch-num patch] (indexed *patches*)]
+     (println (str patch-num ": " (:title patch))))
    (doseq [{:keys [user link-line]} (linked-tickets *ticket*)]
      (let [comment-len (min (- 76 (count user)) (count link-line))]
        (println (str "<" user "> " (subs link-line 0 comment-len)))))))
 
 (defn dup-ticket []
-  {:title (select-title *ticket*)
+  {:title (str (select-title *ticket*) " (from " *ticket-id* ")")
    :milestone *dup-to*
    :priority (select-content *ticket* :ticket :> :priority)
    :text (str "This ticket is for tracking #" *ticket-id*
@@ -157,8 +183,10 @@
 (defn go []
   (binding [*auth* nil
             *project* "clojure"
+            *project-dir* "/home/chouser/proj/clojure/"
             *ticket-id* nil
             *ticket* nil
             *dup-to* nil
+            *patches* nil
             *error-response* nil]
     (repl)))
