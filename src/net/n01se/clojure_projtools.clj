@@ -5,21 +5,29 @@
         [clojure.contrib.prxml :only [prxml]]
         [clojure.contrib.shell-out :only [sh with-sh-dir]]
         [clojure.contrib.seq-utils :only [indexed]]
+        [clojure.contrib.str-utils2 :as str2 :only []]
         [net.cgrand.enlive-html :as enlive :only []]))
 
 (def *auth*)
 (def *project*)
-(def *project-dir*)
+(def *base-dir*)
+(def *work-dir*)
 (def *ticket-id*)
 (def *ticket*)
-(def *dup-to*)
 (def *patches*)
+(def *patch*)
+(def *target-ticket-id*)
+(def *target-ticket*)
+(def *dup-to*)
 (def *error-response*)
 
 (def milestones
-  #{{:id :bugs    :milestone "95732", :branch "1.0",    :dup-to :backlog}
-    {:id :backlog :milestone "93751", :branch "master", :dup-to :bugs}
-    {:id :next    :milestone "93750", :branch "master", :dup-to :bugs}})
+  #{{:id :bugs    :milestone "95732", :branch "heads/1.0", :work-dir "clojure-1.0"
+     :dup-to :backlog}
+    {:id :backlog :milestone "93751", :branch "master", :work-dir "clojure"
+     :dup-to :bugs}
+    {:id :next    :milestone "93750", :branch "master", :work-dir "clojure"
+     :dup-to :bugs}})
 
 (defn uindex
   "Returns a map of the distinct values of ks in the xrel (as
@@ -29,6 +37,10 @@
       (fn [m x]
         (assoc m (vec (map x ks)) x))
       {} xrel))
+
+(defn milestone->
+  ([kname k] ((uindex milestones [kname]) [k]))
+  ([kname k vname] ((milestone-> kname k) vname)))
 
 (Authenticator/setDefault
   (proxy [Authenticator] []
@@ -82,7 +94,7 @@
 (defn get-ticket [project id]
   (get-assembla "spaces/" project "/tickets/" id))
 
-(defn create-ticket [attrmap]
+(defn ticket-vxml [attrmap]
   [:ticket
     (when-let [t (:title attrmap)]
       [:summary t])
@@ -90,8 +102,7 @@
       [:assigned-to-id
         (throw (Exception. ":assigned-to not working yet"))])
     (when-let [m (:milestone attrmap)]
-      [:milestone-id
-        (((uindex milestones [:id]) [m]) :milestone)])
+      [:milestone-id (milestone-> :id m :milestone)])
     (when-let [p (:priority attrmap)] ; 1 (highest) - 5 (lowest)
       [:priority p])
     (when-let [c (:component attrmap)]
@@ -109,9 +120,12 @@
 (defn select-title [ticket]
   (select-content ticket :ticket :> :summary))
 
+(defn select-ticket-id [ticket]
+  (select-content ticket :ticket :> :number))
+
 (defn select-milestone [ticket]
   (let [id (select-content ticket :ticket :> :milestone-id)]
-    ((uindex milestones [:milestone]) [id])))
+    (milestone-> :milestone id)))
 
 (defn select-login [user]
   (select-content user :login_name))
@@ -121,17 +135,34 @@
     {:user (select-login (get-user (select-content tcmt :user-id)))
      :comment (select-content tcmt :comment)}))
 
+(defn git* [& args]
+  (with-sh-dir *work-dir*
+    (let [{:keys [exit out err]} (apply sh :return-map true
+                                        "git" args)]
+      (if (zero? exit)
+        out
+        (throw (Exception. (str "Git exited with code " exit ": "
+                                out " " err)))))))
+
 (defmacro git [& args]
-  `(with-sh-dir *project-dir*
-     (sh "git"
-       ~@(mapcat
-           #(cond
-              (string? %) [%]
-              (and (seq? %) (= (first %) `unquote)) [`(str ~(second %))]
-              (and (seq? %) (= (first %) `unquote-splicing))
-                    `(map str ~(second %))
-              :else [(str %)])
-           args))))
+  `(git*
+     ~@(mapcat
+         #(cond
+            (string? %) [%]
+            (and (seq? %) (= (first %) `unquote)) [`(str ~(second %))]
+            (and (seq? %) (= (first %) `unquote-splicing))
+                  `(map str ~(second %))
+            :else [(str %)])
+         args)))
+
+(defn git-title [sha1]
+  (git log "--pretty=format:%s" -1 ~sha1))
+
+(defn git-message [sha1]
+  (git log "--pretty=format:%s%n%b" -1 ~sha1))
+
+(defn git-head []
+  (git rev-parse --symbolic-full-name HEAD))
 
 (defn linked-tickets [ticket]
   (for [{:keys [comment] :as tcmt} (select-comments ticket)
@@ -143,9 +174,7 @@
 (defn linked-commits [ticket]
   (for [{:keys [comment] :as tcmt} (select-comments ticket)
         [_ sha1] (re-seq #"\[\[(?:r:|[^|]*\|)([0-9a-f]{6,})\]\]" comment)]
-    (assoc tcmt
-           :sha1 sha1
-           :title (git log "--pretty=format:%s" ~sha1 -1))))
+    (assoc tcmt :sha1 sha1 :title (git-title sha1))))
 
 (defn ticket
   ([id] (ticket *project* id))
@@ -156,12 +185,13 @@
    (set! *dup-to* (:dup-to (select-milestone *ticket*)))
    (println "Milestone" (:id (select-milestone *ticket*))
             "   Dup-to" *dup-to*)
-   (set! *patches* (linked-commits *ticket*))
-   (doseq [[patch-num patch] (indexed *patches*)]
-     (println (str patch-num ": " (:title patch))))
-   (doseq [{:keys [user link-line]} (linked-tickets *ticket*)]
-     (let [comment-len (min (- 76 (count user)) (count link-line))]
-       (println (str "<" user "> " (subs link-line 0 comment-len)))))))
+   (binding [*work-dir* (str *base-dir* (milestone-> :id *dup-to* :work-dir))]
+     (set! *patches* (linked-commits *ticket*))
+     (doseq [[patch-num patch] (indexed *patches*)]
+       (println (str patch-num ": " (:title patch))))
+     (doseq [{:keys [user link-line]} (linked-tickets *ticket*)]
+       (let [comment-len (min (- 76 (count user)) (count link-line))]
+         (println (str "<" user "> " (subs link-line 0 comment-len))))))))
 
 (defn dup-ticket []
   {:title (str (select-title *ticket*) " (from " *ticket-id* ")")
@@ -169,24 +199,80 @@
    :priority (select-content *ticket* :ticket :> :priority)
    :text (str "This ticket is for tracking #" *ticket-id*
               " against branch "
-              (((uindex milestones [:id]) [*dup-to*]) :branch))})
+              (milestone-> :id *dup-to* :branch))})
 
 (defn dup-ticket! []
-  ; (let [new-num (select-ticket-number
-  (post-assembla!
-    (str "spaces/" *project* "/tickets/")
-    (create-ticket (dup-ticket)))
+  (set! *target-ticket*
+    (post-assembla!
+      (str "spaces/" *project* "/tickets/")
+      (ticket-vxml (dup-ticket))))
+  (set! *target-ticket-id* (select-ticket-id *target-ticket*))
   ;(update-ticket! ...)
   ;(str "Created ticket #" new-num "to track this issue against branch 1.0."
-  )
+  (println (str "Created #" *target-ticket-id* ": "
+                (select-title *target-ticket*))))
+
+(defn rebase-msg [old-ticket-id new-ticket-id patch]
+  (let [old-msg (git-message (:sha1 patch))]
+    (str (str2/replace old-msg (str "#" old-ticket-id) (str "#" new-ticket-id))
+         "\n(cherry picked from commit " (:sha1 patch) ")\n")))
+
+; XXX doesn't work yet
+(defn attach-file! [ticket-id new-patch title tags]
+  (post-assembla!
+    (str "spaces/" *project* "/tickets/" ticket-id)
+    "create document")
+  (post-assembla!
+    (str "spaces/" *project* "/tickets/" ticket-id)
+    (ticket-vxml {:documents []})))
+
+(defn attach-patch! []
+  (assert *target-ticket-id*)
+  (let [msg (rebase-msg *ticket-id* *target-ticket-id* *patch*)]
+    (git commit --signoff --template=- ~:in ~msg)
+    (let [new-patch (git format-patch "@{1}" --stdout)]
+      (git reset --hard "@{1}")
+      (attach-file! *target-ticket-id* new-patch))))
+
+(defn dup-patch! [& [patch-num]]
+  (binding [*work-dir* (str *base-dir* (milestone-> :id *dup-to* :work-dir))]
+    (let [patch (nth *patches* (or patch-num 0))]
+      (set! *patch* patch)
+      (if (:sha1 patch)
+        ; This is a commit
+        (do
+          (try
+            (git diff --quiet HEAD)
+            (catch Exception e
+              (println "Working dir" *work-dir* "not clean?")
+              (throw e)))
+          (try
+            (git diff --quiet ~(milestone-> :id *dup-to* :branch))
+            (catch Exception e
+              (println "Working dir" *work-dir* "not on branch" (milestone-> :id *dup-to* :branch) "?")
+              (throw e)))
+          (try
+            (git cherry-pick --no-commit ~(:sha1 patch))
+            (catch Exception e
+              (println "Error during cherry-pick.  Probably needs a merge.")
+              (println "Use 'attach-patch!' when ready to proceed.")
+              (throw e)))
+          (println "Cherry-pick was clean.  Proceeding with attach-patch!")
+          (attach-patch!))
+
+        ; Perhaps this is an attached patch file
+        (throw (Exception. "Unsupported patch type"))))))
 
 (defn go []
   (binding [*auth* nil
             *project* "clojure"
-            *project-dir* "/home/chouser/proj/clojure/"
+            *base-dir* "/home/chouser/proj/"
             *ticket-id* nil
             *ticket* nil
-            *dup-to* nil
             *patches* nil
+            *patch* nil
+            *target-ticket-id* nil
+            *target-ticket* nil
+            *dup-to* nil
             *error-response* nil]
     (repl)))

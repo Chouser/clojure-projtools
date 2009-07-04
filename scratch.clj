@@ -67,7 +67,7 @@
       ; replace #old-id with #new-id
       ; append: (cherry picked from commit b03e19aa341fea01c1279a74f4184f6538d0f72e)
       ; launch editor
-      (git commit --signoff --file -) ; < new-msg
+      (git commit --signoff --template=-) ; < new-msg
       (let [new-patch (git format-patch @{1} --stdout)]
         (git reset --hard @{1}) ; maybe new-patch-id^ instead
         (attach new-ticket new-patch)
