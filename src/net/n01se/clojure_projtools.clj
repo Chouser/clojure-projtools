@@ -1,5 +1,12 @@
 (ns net.n01se.clojure-projtools
-  (:import (java.net URL Authenticator PasswordAuthentication))
+  (:import
+    (java.net URL Authenticator PasswordAuthentication)
+    (org.apache.commons.httpclient HttpClient HttpState
+                                   UsernamePasswordCredentials)
+    (org.apache.commons.httpclient.auth AuthScope)
+    (org.apache.commons.httpclient.methods PostMethod)
+    (org.apache.commons.httpclient.methods.multipart
+      MultipartRequestEntity ByteArrayPartSource FilePart StringPart Part))
   (:use [clojure.xml :as xml :only []]
         [clojure.contrib.repl-ln :only [repl]]
         [clojure.contrib.prxml :only [prxml]]
@@ -83,6 +90,32 @@
                                                   (repeatedly #(.read err)))))))
           ;(set! *error-response* (xml/parse err)))
         (throw e)))))
+
+(defn upload-assembla-doc!
+  "Create a new document for assemble project named (ie.
+  \"clojure-contrib\").  The title and filename are frequently the
+  same -- the filename is only visible as the default name of the file
+  when downloaded.  The data must be an array of bytes.  Expects
+  *auth* to be a [username password] vector."
+  [project title filename #^bytes data]
+  (let [[username password] *auth*
+        http-state (doto (HttpState.)
+                         (.setCredentials (AuthScope. "www.assembla.com" 80)
+                                          (UsernamePasswordCredentials.
+                                            username password)))
+        file-post (PostMethod. (str "http://www.assembla.com/spaces/"
+                                    project "/documents/"))
+        parts (into-array
+                Part
+                [(StringPart. "document[name]" title)
+                 (FilePart. "document[file]"
+                            (ByteArrayPartSource. filename data))])]
+    (.setRequestHeader file-post "Accept" "application/xml")
+    (.setRequestEntity file-post
+                       (MultipartRequestEntity. parts (.getParams file-post)))
+    (let [status (.executeMethod (HttpClient.) nil file-post http-state)]
+      (with-open [input (.getResponseBodyAsStream file-post)]
+        (xml/parse input)))))
 
 (let [users (atom {})]
   (defn get-user [id]
@@ -218,21 +251,22 @@
          "\n(cherry picked from commit " (:sha1 patch) ")\n")))
 
 ; XXX doesn't work yet
-(defn attach-file! [ticket-id new-patch title tags]
-  (post-assembla!
-    (str "spaces/" *project* "/tickets/" ticket-id)
-    "create document")
-  (post-assembla!
-    (str "spaces/" *project* "/tickets/" ticket-id)
-    (ticket-vxml {:documents []})))
+(defn attach-file! [ticket-id title filename data tags]
+  (let [new-doc (upload-assembla-doc! *project* filename filename data)
+        doc-id (select-content new-doc :document :> :id)]
+    (post-assembla!
+      (str "spaces/" *project* "/tickets/" ticket-id)
+      (ticket-vxml {:documents []}))))
 
 (defn attach-patch! []
   (assert *target-ticket-id*)
   (let [msg (rebase-msg *ticket-id* *target-ticket-id* *patch*)]
     (git commit --signoff --template=- ~:in ~msg)
-    (let [new-patch (git format-patch "@{1}" --stdout)]
+    (let [new-patch (git format-patch "@{1}" --stdout ~:out ~:bytes)
+          title (str "the patch for the thing")
+          filename (str "ticket-" *target-ticket-id* ".diff")]
       (git reset --hard "@{1}")
-      (attach-file! *target-ticket-id* new-patch))))
+      (attach-file! *target-ticket-id* title filename new-patch ["patch"]))))
 
 (defn dup-patch! [& [patch-num]]
   (binding [*work-dir* (str *base-dir* (milestone-> :id *dup-to* :work-dir))]
