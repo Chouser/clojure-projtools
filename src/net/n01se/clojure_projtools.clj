@@ -1,6 +1,7 @@
 (ns net.n01se.clojure-projtools
   (:import
     (java.net URL Authenticator PasswordAuthentication)
+    (java.io File FileOutputStream OutputStreamWriter)
     (org.apache.commons.httpclient HttpClient HttpState
                                    UsernamePasswordCredentials)
     (org.apache.commons.httpclient.auth AuthScope)
@@ -16,16 +17,6 @@
         [net.cgrand.enlive-html :as enlive :only []]))
 
 (def *auth*)
-(def *project*)
-(def *base-dir*)
-(def *work-dir*)
-(def *ticket-id*)
-(def *ticket*)
-(def *patches*)
-(def *patch*)
-(def *target-ticket-id*)
-(def *target-ticket*)
-(def *dup-to*)
 (def *error-response*)
 
 (def milestones
@@ -53,6 +44,7 @@
   (proxy [Authenticator] []
     (getPasswordAuthentication []
       (when-let [[user pw] *auth*]
+        (prn :authorizing user)
         (PasswordAuthentication. user (.toCharArray pw))))))
 
 (defn get-assembla [& parts]
@@ -80,9 +72,10 @@
       (binding [*out* output]
         (prxml vxml)))
     (try
-      (with-open [input (.getInputStream conn)]
-        (xml/parse input))
-      (catch java.io.IOException e
+      (prn :trying)
+      (.getInputStream conn)
+      (prn :ok)
+      (catch Throwable e
         (with-open [err (.getErrorStream conn)]
                    (println
                      (apply str
@@ -91,31 +84,37 @@
           ;(set! *error-response* (xml/parse err)))
         (throw e)))))
 
-(defn upload-assembla-doc!
+(defn attach-assembla-doc!
   "Create a new document for assemble project named (ie.
   \"clojure-contrib\").  The title and filename are frequently the
   same -- the filename is only visible as the default name of the file
   when downloaded.  The data must be an array of bytes.  Expects
   *auth* to be a [username password] vector."
-  [project title filename #^bytes data]
+  [project attachable-id attachable-type tags title filename #^bytes data]
   (let [[username password] *auth*
         http-state (doto (HttpState.)
                          (.setCredentials (AuthScope. "www.assembla.com" 80)
                                           (UsernamePasswordCredentials.
                                             username password)))
         file-post (PostMethod. (str "http://www.assembla.com/spaces/"
-                                    project "/documents/"))
+                                    project
+                                    "/documents/attach_to_ticket"))
         parts (into-array
                 Part
-                [(StringPart. "document[name]" title)
+                [(StringPart. "document[0][attachable-id]" attachable-id)
+                 (StringPart. "document[0][attachable-type]" 
+                              ({:flow "Flow"} attachable-type "Ticket"))
+                 (StringPart. "document[0][description]" title)
+                 (StringPart. "document[0][tag-field]" (str2/join "," tags))
                  (FilePart. "document[file]"
                             (ByteArrayPartSource. filename data))])]
     (.setRequestHeader file-post "Accept" "application/xml")
     (.setRequestEntity file-post
                        (MultipartRequestEntity. parts (.getParams file-post)))
     (let [status (.executeMethod (HttpClient.) nil file-post http-state)]
-      (with-open [input (.getResponseBodyAsStream file-post)]
-        (xml/parse input)))))
+      (println (.getResponseBodyAsString file-post)))))
+      ;(with-open [input (.getResponseBodyAsStream file-post)]
+        ;(xml/parse input)))))
 
 (let [users (atom {})]
   (defn get-user [id]
@@ -153,7 +152,10 @@
 (defn select-title [ticket]
   (select-content ticket :ticket :> :summary))
 
-(defn select-ticket-id [ticket]
+(defn select-id [ticket]
+  (select-content ticket :ticket :> :id))
+
+(defn select-num [ticket]
   (select-content ticket :ticket :> :number))
 
 (defn select-milestone [ticket]
@@ -164,14 +166,17 @@
   (select-content user :login_name))
 
 (defn select-comments [ticket]
-  (for [tcmt (enlive/select [*ticket*] [:ticket-comment])]
+  ; XXX include ticket description?
+  (for [tcmt (enlive/select [ticket] [:ticket-comment])]
     {:user (select-login (get-user (select-content tcmt :user-id)))
      :comment (select-content tcmt :comment)}))
 
+(def *work-dir*)
+
 (defn git* [& args]
   (with-sh-dir *work-dir*
-    (let [{:keys [exit out err]} (apply sh :return-map true
-                                        "git" args)]
+    (println "git args:" args)
+    (let [{:keys [exit out err]} (apply sh :return-map true "git" args)]
       (if (zero? exit)
         out
         (throw (Exception. (str "Git exited with code " exit ": "
@@ -179,9 +184,22 @@
 
 (defmacro git [& args]
   `(git*
+     ~@(loop [[arg & nargs :as args] args, out []]
+          (if (empty? args)
+            out
+            (cond
+              (keyword? arg) (let [[v & nnargs] nargs]
+                               (recur nnargs (conj out arg v)))
+              (seq? arg) (if (= (first arg) `unquote)
+                           (recur nargs (conj out `(str ~(second arg))))
+                           (throw (Exception. "Unspoorted list in git macro")))
+              :else (recur nargs (conj out (str arg))))))))
+
+(defmacro git [& args]
+  `(git*
      ~@(mapcat
          #(cond
-            (string? %) [%]
+            (keyword? %) [%]
             (and (seq? %) (= (first %) `unquote)) [`(str ~(second %))]
             (and (seq? %) (= (first %) `unquote-splicing))
                   `(map str ~(second %))
@@ -192,7 +210,7 @@
   (git log "--pretty=format:%s" -1 ~sha1))
 
 (defn git-message [sha1]
-  (git log "--pretty=format:%s%n%b" -1 ~sha1))
+  (git log "--pretty=format:%s%n%n%b" -1 ~sha1))
 
 (defn git-head []
   (git rev-parse --symbolic-full-name HEAD))
@@ -209,28 +227,61 @@
         [_ sha1] (re-seq #"\[\[(?:r:|[^|]*\|)([0-9a-f]{6,})\]\]" comment)]
     (assoc tcmt :sha1 sha1 :title (git-title sha1))))
 
+(defn rebase-msg [old-ticket-num new-ticket-num patch]
+  {:pre [old-ticket-num new-ticket-num patch]}
+  (let [old-msg (git-message (:sha1 patch))]
+    (str (str2/replace
+           old-msg (str "#" old-ticket-num) (str "#" new-ticket-num))
+         "\n(cherry picked from commit " (:sha1 patch) ")\n")))
+
+
+(def *project*)
+(def *base-dir*)
+(def *ticket*)
+(def *patches*)
+(def *patch*)
+(def *target-ticket*)
+(def *dup-to*)
+
 (defn ticket
-  ([id] (ticket *project* id))
-  ([project id]
-   (set! *ticket* (get-ticket project id))
-   (set! *ticket-id* id)
-   (println (str "\n=== #" id ": " (select-title *ticket*) " ==="))
-   (set! *dup-to* (:dup-to (select-milestone *ticket*)))
-   (println "Milestone" (:id (select-milestone *ticket*))
-            "   Dup-to" *dup-to*)
-   (binding [*work-dir* (str *base-dir* (milestone-> :id *dup-to* :work-dir))]
-     (set! *patches* (linked-commits *ticket*))
-     (doseq [[patch-num patch] (indexed *patches*)]
-       (println (str patch-num ": " (:title patch))))
-     (doseq [{:keys [user link-line]} (linked-tickets *ticket*)]
-       (let [comment-len (min (- 76 (count user)) (count link-line))]
-         (println (str "<" user "> " (subs link-line 0 comment-len))))))))
+  ([tnum] (ticket *project* :main tnum))
+  ([which tnum] (ticket *project* which tnum))
+  ([project which tnum]
+   (when project
+     (set! *project* project))
+   (let [ticket (get-ticket project tnum)
+         milestone (select-milestone ticket)]
+     (if (= which :main)
+       (do
+         (println (str "\n=== #" tnum ": " (select-title ticket) " ==="))
+         (set! *dup-to* (:dup-to milestone))
+         (set! *ticket* ticket)
+         (set! *target-ticket* nil))
+       (do
+         (println (str "\n>>> #" tnum ": " (select-title ticket) " <<<"))
+         (set! *target-ticket* ticket)))
+
+     (print "Which" (get #{:main} which :target) "  ")
+     (print "Milestone" (:id (select-milestone ticket))  "  ")
+     (when (= which :main)
+       (print "   Dup-to" *dup-to*))
+     (println)
+
+     (binding [*work-dir* (str *base-dir* (:work-dir milestone))]
+       (let [patches (linked-commits ticket)]
+         (doseq [[patch-num patch] (indexed patches)]
+           (println (str patch-num ": " (:title patch))))
+         (when (= which :main)
+           (set! *patches* patches))
+         (doseq [{:keys [user link-line]} (linked-tickets ticket)]
+           (let [comment-len (min (- 76 (count user)) (count link-line))]
+             (println (str "<" user "> " (subs link-line 0 comment-len))))))))))
 
 (defn dup-ticket []
-  {:title (str (select-title *ticket*) " (from " *ticket-id* ")")
+  {:title (str (select-title *ticket*) " (from " (select-num *ticket*) ")")
    :milestone *dup-to*
    :priority (select-content *ticket* :ticket :> :priority)
-   :text (str "This ticket is for tracking #" *ticket-id*
+   :text (str "This ticket is for tracking #" (select-num *ticket*)
               " against branch "
               (milestone-> :id *dup-to* :branch))})
 
@@ -239,34 +290,33 @@
     (post-assembla!
       (str "spaces/" *project* "/tickets/")
       (ticket-vxml (dup-ticket))))
-  (set! *target-ticket-id* (select-ticket-id *target-ticket*))
   ;(update-ticket! ...)
   ;(str "Created ticket #" new-num "to track this issue against branch 1.0."
-  (println (str "Created #" *target-ticket-id* ": "
+  (println (str "Created #" (select-num *target-ticket*) ": "
                 (select-title *target-ticket*))))
 
-(defn rebase-msg [old-ticket-id new-ticket-id patch]
-  (let [old-msg (git-message (:sha1 patch))]
-    (str (str2/replace old-msg (str "#" old-ticket-id) (str "#" new-ticket-id))
-         "\n(cherry picked from commit " (:sha1 patch) ")\n")))
-
-; XXX doesn't work yet
-(defn attach-file! [ticket-id title filename data tags]
-  (let [new-doc (upload-assembla-doc! *project* filename filename data)
-        doc-id (select-content new-doc :document :> :id)]
-    (post-assembla!
-      (str "spaces/" *project* "/tickets/" ticket-id)
-      (ticket-vxml {:documents []}))))
-
-(defn attach-patch! []
-  (assert *target-ticket-id*)
-  (let [msg (rebase-msg *ticket-id* *target-ticket-id* *patch*)]
-    (git commit --signoff --template=- ~:in ~msg)
-    (let [new-patch (git format-patch "@{1}" --stdout ~:out ~:bytes)
-          title (str "the patch for the thing")
-          filename (str "ticket-" *target-ticket-id* ".diff")]
-      (git reset --hard "@{1}")
-      (attach-file! *target-ticket-id* title filename new-patch ["patch"]))))
+(defn attach-dup-patch! []
+  {:pre [*target-ticket*]}
+  (binding [*work-dir* (str *base-dir* (milestone-> :id *dup-to* :work-dir))]
+    (let [msg-filename (str *work-dir* "/.git/PROJTOOLS-MSG")
+          msg (rebase-msg
+                (select-num *ticket*) (select-num *target-ticket*) *patch*)]
+      (with-open [msg-file (-> msg-filename File. FileOutputStream.
+                               OutputStreamWriter.)]
+        (.write msg-file msg))
+      (sh "gvim" "--nofork" msg-filename)
+      (git commit --signoff ~(str "--file=" msg-filename))
+      (let [new-patch (git format-patch "@{1}" --stdout :out :bytes)
+            title (str "The fix from " (select-num *ticket*)
+                       " rebased to " (milestone-> :id *dup-to* :branch))
+            filename (str "ticket-" (select-num *target-ticket*)
+                          "-from-" (select-num *ticket*) ".diff")]
+        (git reset --hard "@{1}")
+        ;(doseq [b new-patch] (.append *out* (char b)))
+        (attach-assembla-doc! *project* (select-id *target-ticket*)
+                              :ticket ["patch"] title filename
+                              new-patch)
+        ))))
 
 (defn dup-patch! [& [patch-num]]
   (binding [*work-dir* (str *base-dir* (milestone-> :id *dup-to* :work-dir))]
@@ -291,21 +341,21 @@
               (println "Error during cherry-pick.  Probably needs a merge.")
               (println "Use 'attach-patch!' when ready to proceed.")
               (throw e)))
-          (println "Cherry-pick was clean.  Proceeding with attach-patch!")
-          (attach-patch!))
+          (println "Cherry-pick was clean.  Proceeding with attach-dup-patch!")
+          (attach-dup-patch!))
 
         ; Perhaps this is an attached patch file
+        ; (select-content *ticket* :ticket :> :documents :> :document :id)
+        ; ==> "cX-0jCw4Cr3RbzeJe5afGb"
         (throw (Exception. "Unsupported patch type"))))))
 
 (defn go []
   (binding [*auth* nil
             *project* "clojure"
             *base-dir* "/home/chouser/proj/"
-            *ticket-id* nil
             *ticket* nil
             *patches* nil
             *patch* nil
-            *target-ticket-id* nil
             *target-ticket* nil
             *dup-to* nil
             *error-response* nil]
