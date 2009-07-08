@@ -96,16 +96,19 @@
                          (.setCredentials (AuthScope. "www.assembla.com" 80)
                                           (UsernamePasswordCredentials.
                                             username password)))
-        file-post (PostMethod. (str "http://www.assembla.com/spaces/"
+        file-post (PostMethod. (str "http://localhost:9000/spaces/"
                                     project
                                     "/documents/attach_to_ticket"))
         parts (into-array
                 Part
-                [(StringPart. "document[0][attachable-id]" attachable-id)
-                 (StringPart. "document[0][attachable-type]" 
+                [(StringPart. "document[0][attachable_id]" attachable-id)
+                 (StringPart. "document[0][attachable_type]" 
                               ({:flow "Flow"} attachable-type "Ticket"))
                  (StringPart. "document[0][description]" title)
-                 (StringPart. "document[0][tag-field]" (str2/join "," tags))
+                 (StringPart. "document[0][tag_field]" (str2/join "," tags))
+                 (StringPart. "redirect_to_url"
+                              "/spaces/clojure/tickets/141-GC-Issue-119--require-doc-out-of-date")
+                 (StringPart. "commit" "Submit and Add File(s)")
                  (FilePart. "document[file]"
                             (ByteArrayPartSource. filename data))])]
     (.setRequestHeader file-post "Accept" "application/xml")
