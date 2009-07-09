@@ -2,12 +2,13 @@
   (:import
     (java.net URL Authenticator PasswordAuthentication)
     (java.io File FileOutputStream OutputStreamWriter)
-    (org.apache.commons.httpclient HttpClient HttpState
-                                   UsernamePasswordCredentials)
-    (org.apache.commons.httpclient.auth AuthScope)
-    (org.apache.commons.httpclient.methods PostMethod)
-    (org.apache.commons.httpclient.methods.multipart
-      MultipartRequestEntity ByteArrayPartSource FilePart StringPart Part))
+;    (org.apache.commons.httpclient HttpClient HttpState
+;                                   UsernamePasswordCredentials)
+;    (org.apache.commons.httpclient.auth AuthScope)
+;    (org.apache.commons.httpclient.methods PostMethod)
+;    (org.apache.commons.httpclient.methods.multipart
+;      MultipartRequestEntity ByteArrayPartSource FilePart StringPart Part)
+    )
   (:use [clojure.xml :as xml :only []]
         [clojure.contrib.repl-ln :only [repl]]
         [clojure.contrib.prxml :only [prxml]]
@@ -91,30 +92,31 @@
   when downloaded.  The data must be an array of bytes.  Expects
   *auth* to be a [username password] vector."
   [project attachable-id attachable-type tags title filename #^bytes data]
-  (let [[username password] *auth*
-        http-state (doto (HttpState.)
-                         (.setCredentials (AuthScope. "www.assembla.com" 80)
-                                          (UsernamePasswordCredentials.
-                                            username password)))
-        file-post (PostMethod. (str "http://www.assembla.com/spaces/"
-                                    project
-                                    "/documents/attach_to_ticket"))
-        parts (into-array
-                Part
-                [(StringPart. "document[0][attachable-id]" attachable-id)
-                 (StringPart. "document[0][attachable-type]" 
-                              ({:flow "Flow"} attachable-type "Ticket"))
-                 (StringPart. "document[0][description]" title)
-                 (StringPart. "document[0][tag-field]" (str2/join "," tags))
-                 (FilePart. "document[file]"
-                            (ByteArrayPartSource. filename data))])]
-    (.setRequestHeader file-post "Accept" "application/xml")
-    (.setRequestEntity file-post
-                       (MultipartRequestEntity. parts (.getParams file-post)))
-    (let [status (.executeMethod (HttpClient.) nil file-post http-state)]
-      (println (.getResponseBodyAsString file-post)))))
-      ;(with-open [input (.getResponseBodyAsStream file-post)]
-        ;(xml/parse input)))))
+;  (let [[username password] *auth*
+;        http-state (doto (HttpState.)
+;                         (.setCredentials (AuthScope. "www.assembla.com" 80)
+;                                          (UsernamePasswordCredentials.
+;                                            username password)))
+;        file-post (PostMethod. (str "http://www.assembla.com/spaces/"
+;                                    project
+;                                    "/documents/attach_to_ticket"))
+;        parts (into-array
+;                Part
+;                [(StringPart. "document[0][attachable-id]" attachable-id)
+;                 (StringPart. "document[0][attachable-type]" 
+;                              ({:flow "Flow"} attachable-type "Ticket"))
+;                 (StringPart. "document[0][description]" title)
+;                 (StringPart. "document[0][tag-field]" (str2/join "," tags))
+;                 (FilePart. "document[file]"
+;                            (ByteArrayPartSource. filename data))])]
+;    (.setRequestHeader file-post "Accept" "application/xml")
+;    (.setRequestEntity file-post
+;                       (MultipartRequestEntity. parts (.getParams file-post)))
+;    (let [status (.executeMethod (HttpClient.) nil file-post http-state)]
+;      (println (.getResponseBodyAsString file-post)))))
+;      ;(with-open [input (.getResponseBodyAsStream file-post)]
+;        ;(xml/parse input))))
+)
 
 (let [users (atom {})]
   (defn get-user [id]
@@ -175,7 +177,6 @@
 
 (defn git* [& args]
   (with-sh-dir *work-dir*
-    (println "git args:" args)
     (let [{:keys [exit out err]} (apply sh :return-map true "git" args)]
       (if (zero? exit)
         out
@@ -348,6 +349,26 @@
         ; (select-content *ticket* :ticket :> :documents :> :document :id)
         ; ==> "cX-0jCw4Cr3RbzeJe5afGb"
         (throw (Exception. "Unsupported patch type"))))))
+
+; java -cp ../clojure/clojure.jar:../clojure-contrib/src:../../build/enlive/src:../../build/enlive/lib/tagsoup-1.2.jar clojure.main -i src/net/n01se/clojure_projtools.clj -e '(apply net.n01se.clojure-projtools/commit-new-ticket *command-line-args*)' -- -a
+
+(defn commit-new-ticket [& commit-args]
+  (let [rtn-map (apply sh :return-map true :env {"EDITOR" "cat"}
+                       "git" "commit" commit-args)
+        {:keys [exit out err]} rtn-map]
+    (println "Got:\n" out)
+    (.exec (Runtime/getRuntime) (into-array ["vim"]))
+    (println "done"))
+
+  ; compute commit-msg
+  ; launch editor
+  ; assert message given
+  ; fix message for ticket
+  ; create ticket
+  ; fix message for commit
+  ; do commit
+)
+
 
 (defn go []
   (binding [*auth* nil
