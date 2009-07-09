@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# USER_PASS=user:password
-# SPACE=clojure-contrib
+# USER_PASS=user:password@
+SPACE="${SPACE-clojure-contrib}"
 
 msgfile1="$(tempfile --prefix=msg- --suffix=.txt)"
 msgfile2="$(tempfile --prefix=msg- --suffix=.txt)"
@@ -31,13 +31,25 @@ else
       sum=$(head -n 1 "$msgfile1")
 
       # Create a new ticket and collect its number
-      xml=$(curl -i -X POST -H "Accept: application/xml" -d "ticket[summary]=$sum" "http://$USER_PASS@www.assembla.com/spaces/$SPACE/tickets")
+      xml=$(curl -i -X POST -H "Accept: application/xml" -d "ticket[summary]=$sum" "http://${USER_PASS}www.assembla.com/spaces/$SPACE/tickets")
 
-      # TODO: extract ticket number
-      sed 's/##/#$ticket/g' -i "$msgfile1"
+      # Extract ticket number
+      ticket="${xml#*<number}"
+      ticket="${ticket#*>}"
+      ticket="${ticket%%<*}"
+      if [[ "${ticket#[0-9]*}" ]]; then
+        echo "Failed to get new ticket number. Skipping commit."
+        echo "$xml"
+      else
+        # Insert ticket number into commit message
+        sed "s/##/#$ticket/g" -i "$msgfile1"
 
-      # Commit modified message
-      git commit --file="$msgfile1" --cleanup="strip" "$@"
+        # Strip comment lines as they'll be re-inserted by --template
+        sed -n '/^[^#]/p' -i "$msgfile1"
+
+        # Commit modified message
+        git commit --template="$msgfile1" "$@"
+      fi
     else
       # No ## found in message, so no ticket should be created.
       if grep "#\d" "$msgfile1"; then
