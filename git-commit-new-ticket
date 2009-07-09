@@ -1,19 +1,21 @@
 #!/bin/bash
 
-# USER_PASS=user:password@
-SPACE="${SPACE-clojure-contrib}"
+SPACE="${SPACE:-clojure-contrib}"
+EDITOR="${EDITOR:-vi}"
 
-msgfile1="$(tempfile --prefix=msg- --suffix=.txt)"
-msgfile2="$(tempfile --prefix=msg- --suffix=.txt)"
+if [[ -z "$ASSEMBLA_AUTH" ]]; then
+    echo "ASSEMBLA_AUTH must be set to something like user:password"
+    exit 1
+fi
 
-# Capture the prompt text from "git commit"
+msgfile1="$(tempfile --prefix=msg- --suffix=.txt)" || exit
+msgfile2="$(tempfile --prefix=msg- --suffix=.txt)" || exit
+
+# Capture the prompt text from "git commit" -- won't actually commit
 EDITOR="cat > $msgfile1" git commit "$@" 2>/dev/null
 
 # Is there anything to commit?
-if cmp -s "$msgfile1" /dev/null; then
-  # nope -- and the error has already been printed by git. We're done.
-  :
-else
+if [[ -s "$msgfile1" ]]; then
   # Commit message prompt text is ready.  Save a copy, and allow the
   # user to edit the original.
   cp "$msgfile1" "$msgfile2"
@@ -26,37 +28,37 @@ else
     EDITOR="cat > /dev/null" git commit "$@"
   else
     # User edited the commit message
-    if grep "##" "$msgfile1"; then
+    if grep -q "bug#" "$msgfile1"; then
       # Found sentinel that will be replaced with the new ticket number
       sum=$(head -n 1 "$msgfile1")
 
       # Create a new ticket and collect its number
-      xml=$(curl -i -X POST -H "Accept: application/xml" -d "ticket[summary]=$sum" "http://${USER_PASS}www.assembla.com/spaces/$SPACE/tickets")
+      xml=$(curl -i -X POST -H "Accept: application/xml" -d "ticket[summary]=$sum" "http://${ASSEMBLA_AUTH}@www.assembla.com/spaces/$SPACE/tickets" 2>/dev/null)
 
       # Extract ticket number
-      ticket="${xml#*<number}"
-      ticket="${ticket#*>}"
+      ticket="${xml#*<number*>}"
       ticket="${ticket%%<*}"
-      if [[ "${ticket#[0-9]*}" ]]; then
+      if [[ -n "$ticket" && $ticket == *[!0-9]* ]]; then
         echo "Failed to get new ticket number. Skipping commit."
         echo "$xml"
       else
         # Insert ticket number into commit message
-        sed "s/##/#$ticket/g" -i "$msgfile1"
+        sed -i "s/bug#/#$ticket/g" "$msgfile1"
 
         # Strip comment lines as they'll be re-inserted by --template
-        sed -n '/^[^#]/p' -i "$msgfile1"
+        sed -ni '/^[^#]/p' "$msgfile1"
 
         # Commit modified message
         git commit --template="$msgfile1" "$@"
       fi
     else
-      # No ## found in message, so no ticket should be created.
-      if grep "#\d" "$msgfile1"; then
+      # No "bug#" sentinel found in message, so no ticket should be created.
+      if grep "#[0-9]" "$msgfile1"; then
         # Some existing ticket was mentioned -- do the commit
         git commit --file="$msgfile1" --cleanup="strip" "$@"
       else
-        echo "No ticket or new-ticket sentinel was found.  ^C to abort."
+        echo "No ticket or new-ticket sentinel was found."
+        echo "^C to abort, <Enter> to continue"
         read
         git commit --file="$msgfile1" --cleanup="strip" "$@"
       fi
